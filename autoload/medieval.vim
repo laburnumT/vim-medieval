@@ -1,5 +1,5 @@
 const s:fences = [#{start: '\([`~]\{3,}\)\s*\%({\s*\.\?\)\?\(\a\+\)\?', end: '\1', lang: 2,}, #{start: '\$\$'}]
-let s:opts = ['name', 'target', 'require', 'tangle']
+let s:opts = ['name', 'target', 'require', 'tangle', 'session']
 let s:optspat = '\(' . join(s:opts, '\|') . '\):\s*\([0-9A-Za-z_+.$#&/-]\+\)'
 let s:optionfmt = '<!-- %s -->'
 let s:optionpat = '^\s*<!--\s*'
@@ -265,6 +265,87 @@ function! medieval#evalrange(line1, line2, target) abort
     call winrestview(view)
 endfunction
 
+function! s:session_read_cb(channel, msg) abort
+    let key = ''
+    for [k, s] in items(s:active_sessions)
+        if s.channel == a:channel
+            let key = k
+            break
+        endif
+    endfor
+
+    if empty(key)
+        return
+    endif
+
+    let session = s:active_sessions[key]
+    let session.buffer += [a:msg]
+
+    if !empty(session.token) && match(session.buffer, session.token) >= 0
+        let output = session.buffer
+        let token = session.token
+        let context = session.context
+
+        let session.token = ''
+        let session.context = {}
+
+        let token_idx = match(output, token)
+        if token_idx > 0
+            let output = output[:token_idx - 1]
+        elseif token_idx == 0
+            let output = []
+        endif
+
+        call context.cb(output)
+    endif
+endfunction
+
+function! s:eval_session(lang, session_name, block, cb) abort
+    if !exists('s:active_sessions')
+        let s:active_sessions = {}
+    endif
+
+    if !exists('s:session_buffers')
+        let s:session_buffers = {}
+    endif
+
+    let key = a:lang . ':' . a:session_name
+    let eof_token = '__MEDIEVAL_SESSION_EOF__' . reltimestr(reltime())
+    if !has_key(s:active_sessions, key) || job_status(ch_getjob(s:active_sessions[key].channel)) !=# 'run'
+        let cmd = [a:lang]
+        if a:lang ==# 'python' || a:lang ==# 'python3'
+            let cmd += ['-i', '-q']
+        endif
+        let job = job_start(l:cmd, {
+                    \ 'out_cb': function('s:session_read_cb'),
+                    \ 'err_cb': function('s:session_read_cb'),
+                    \ 'mode': 'nl',
+                    \ })
+        let s:active_sessions[key] = {
+                    \ 'channel': job_getchannel(job),
+                    \ 'buffer': [],
+                    \ 'token': '',
+                    \ 'context': {},
+                    \ }
+    endif
+
+    let session = s:active_sessions[key]
+    let session.buffer = []
+    let session.token = eof_token
+    let session.context = {'cb': a:cb}
+
+    for line in a:block
+        call ch_sendraw(session.channel, line . "\n")
+    endfor
+
+    let use_token = v:true
+    if a:lang =~# 'python'
+        call ch_sendraw(session.channel, 'print("' . eof_token . '")' . "\n")
+    else
+        call ch_sendraw(session.channel, 'echo "' . eof_token . '"' . "\n")
+    endif
+endfunction
+
 function! medieval#eval(...) abort
     if !exists('g:medieval_langs')
         call s:error('g:medieval_langs is unset')
@@ -378,11 +459,16 @@ function! medieval#eval(...) abort
     if has_key(opts, 'setup')
         call opts.setup(context, block)
     endif
-    call writefile(block, fname)
-    if lang == "cmd"
-        call s:jobstart([fname], function('s:callback', [context]))
+
+    if has_key(opts, 'session')
+        call s:eval_session(lang, opts.session, block, function('s:callback', [context]))
     else
-        call s:jobstart([lang, fname], function('s:callback', [context]))
+        call writefile(block, fname)
+        if lang == "cmd"
+            call s:jobstart([fname], function('s:callback', [context]))
+        else
+            call s:jobstart([lang, fname], function('s:callback', [context]))
+        endif
     endif
     call winrestview(view)
 endfunction
