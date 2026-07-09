@@ -265,21 +265,23 @@ function! medieval#evalrange(line1, line2, target) abort
     call winrestview(view)
 endfunction
 
-function! s:session_read_cb(channel, msg) abort
-    let key = ''
-    for [k, s] in items(s:active_sessions)
-        if s.channel == a:channel
-            let key = k
-            break
-        endif
-    endfor
-
-    if empty(key)
+function! s:session_read(key, lines) abort
+    if !has_key(s:active_sessions, a:key)
         return
     endif
 
-    let session = s:active_sessions[key]
-    let session.buffer += [a:msg]
+    let session = s:active_sessions[a:key]
+
+    if type(a:lines) == v:t_list
+        let data = a:lines
+        if !empty(data) && data[-1] ==# ''
+            let data = data[:-2]
+            let session.buffer += data
+        endif
+    else
+        let session.buffer += [a:lines]
+    endif
+
 
     if !empty(session.token) && match(session.buffer, session.token) >= 0
         let output = session.buffer
@@ -300,6 +302,33 @@ function! s:session_read_cb(channel, msg) abort
     endif
 endfunction
 
+function! s:vim_cb(channel, msg) abort
+    for [k, s] in items(s:active_sessions)
+        if s.id == a:channel
+            call s:session_read(k, a:msg)
+            break
+        endif
+    endfor
+endfunction
+
+function! s:nvim_cb(job_id, data, event) abort
+    for [k, s] in items(s:active_sessions)
+        if s.id == a:job_id
+            call s:session_read(k, a:data)
+            break
+        endif
+    endfor
+endfunction
+
+function! s:nvim_session_exit_cb(job_id, exit_code, event) abort
+    for [k, s] in items(s:active_sessions)
+        if s.id == a:job_id
+            call remove(s:active_sessions, k)
+            break
+        endif
+    endfor
+endfunction
+
 function! s:eval_session(lang, session_name, block, cb) abort
     if !exists('s:active_sessions')
         let s:active_sessions = {}
@@ -311,22 +340,52 @@ function! s:eval_session(lang, session_name, block, cb) abort
 
     let key = a:lang . ':' . a:session_name
     let eof_token = '__MEDIEVAL_SESSION_EOF__' . reltimestr(reltime())
-    if !has_key(s:active_sessions, key) || job_status(ch_getjob(s:active_sessions[key].channel)) !=# 'run'
+    let running = has_key(s:active_sessions, key)
+
+    if running
+        let session = s:active_sessions[key]
+        if !has('nvim')
+            let running = job_status(session.job) ==# 'run'
+        endif
+    endif
+
+    if !running
         let cmd = [a:lang]
         if a:lang ==# 'python' || a:lang ==# 'python3'
             let cmd += ['-i', '-q']
         endif
-        let job = job_start(l:cmd, {
-                    \ 'out_cb': function('s:session_read_cb'),
-                    \ 'err_cb': function('s:session_read_cb'),
-                    \ 'mode': 'nl',
-                    \ })
-        let s:active_sessions[key] = {
-                    \ 'channel': job_getchannel(job),
-                    \ 'buffer': [],
-                    \ 'token': '',
-                    \ 'context': {},
-                    \ }
+
+        if has('nvim')
+            let id = jobstart(cmd, {
+                        \ 'on_stdout': function('s:nvim_cb'),
+                        \ 'on_stderr': function('s:nvim_cb'),
+                        \ 'on_exit': function('s:nvim_session_exit_cb'),
+                        \ 'stdout_buffered': 0,
+                        \ 'stderr_buffered': 0,
+                        \ })
+            if id <= 0
+                return s:error('Failed to start job for ' . a:lang)
+            endif
+            let s:active_sessions[key] = {
+                        \ 'id': id,
+                        \ 'buffer': [],
+                        \ 'token': '',
+                        \ 'context': {},
+                        \ }
+        else
+            let job = job_start(l:cmd, {
+                        \ 'out_cb': function('s:vim_cb'),
+                        \ 'err_cb': function('s:vim_cb'),
+                        \ 'mode': 'nl',
+                        \ })
+            let s:active_sessions[key] = {
+                        \ 'id': job_getchannel(job),
+                        \ 'job': job,
+                        \ 'buffer': [],
+                        \ 'token': '',
+                        \ 'context': {},
+                        \ }
+        endif
     endif
 
     let session = s:active_sessions[key]
@@ -334,15 +393,19 @@ function! s:eval_session(lang, session_name, block, cb) abort
     let session.token = eof_token
     let session.context = {'cb': a:cb}
 
-    for line in a:block
-        call ch_sendraw(session.channel, line . "\n")
-    endfor
-
-    let use_token = v:true
+    let new_block = copy(a:block)
     if a:lang =~# 'python'
-        call ch_sendraw(session.channel, 'print("' . eof_token . '")' . "\n")
+        let new_block += ['print("' . eof_token . '")']
     else
-        call ch_sendraw(session.channel, 'echo "' . eof_token . '"' . "\n")
+        let new_block += ['echo "' . eof_token . '"']
+    endif
+
+    if has('nvim')
+        call chansend(session.id, new_block + [''])
+    else
+        for line in new_block
+            call ch_sendraw(session.id, line . "\n")
+        endfor
     endif
 endfunction
 
